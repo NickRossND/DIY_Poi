@@ -63,12 +63,28 @@ bool     povActive      = false;
 // ESP-NOW broadcast address — reaches all nearby ESP-NOW receivers
 uint8_t espNowBroadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+// Set to true by the BT connect callback; loop() sends the help text then clears it
+volatile bool sendHelpOnConnect = false;
+
+// ============================================================
+// btCallback()
+// ============================================================
+// Runs on the BT stack task — only set a flag here; do not call
+// SerialBT directly from this context.
+// ============================================================
+void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
+  if (event == ESP_SPP_SRV_OPEN_EVT) {
+    sendHelpOnConnect = true;
+  }
+}
+
 // ============================================================
 // setup()
 // ============================================================
 void setup() {
   Serial.begin(115200);
   SerialBT.begin("ESP32-BT-Slave");
+  SerialBT.register_callback(btCallback);
 
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
@@ -104,6 +120,33 @@ void setup() {
 // loop()
 // ============================================================
 void loop() {
+  // ------------------------------------------------------------
+  // Send command help text on first connect (flag set by btCallback)
+  // ------------------------------------------------------------
+  if (sendHelpOnConnect) {
+    sendHelpOnConnect = false;
+    SerialBT.println("=== DIY Poi Commands ===");
+    SerialBT.println("led on / led off");
+    SerialBT.println("color <name|#RRGGBB|random>");
+    SerialBT.println("  names: red green blue white yellow cyan");
+    SerialBT.println("         magenta purple orange pink teal gold black");
+    SerialBT.println("bright <0-255>");
+    SerialBT.println("pattern 1=1Hz  2=10Hz  3=50Hz  4=pulse");
+    SerialBT.println("pov rainbow");
+    SerialBT.println("pov stripes red,white,blue");
+    SerialBT.println("pov rings red,green,blue");
+    SerialBT.println("pov gradient purple,black");
+    SerialBT.println("pov sine yellow,black");
+    SerialBT.println("pov diamond gold,black");
+    SerialBT.println("pov zigzag red,white,black");
+    SerialBT.println("pov stepped red,white,gold,black");
+    SerialBT.println("pov sparkle white,black");
+    SerialBT.println("pov text HELLO  (uses current color)");
+    SerialBT.println("pov off");
+    SerialBT.println("speed <200-100000>  (us/col, default 2000)");
+    SerialBT.println("========================");
+  }
+
   // ------------------------------------------------------------
   // Step 1: Read Bluetooth data character by character
   // ------------------------------------------------------------
