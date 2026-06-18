@@ -1,114 +1,148 @@
 // ============================================================
-// main.ino
+// bluetoothStrip.ino
 // ============================================================
-// This program controls a WS2812 LED strip using Bluetooth commands.
-// The ESP32 receives text commands like “led on”, “pattern 1”,
-// “color red”, etc., and performs corresponding LED animations.
+// Controls a WS2812 LED strip via Bluetooth text commands.
+//
+// EXISTING COMMANDS (unchanged):
+//   led on / led off
+//   color red / color #FF00AA / color random
+//   bright 128
+//   pattern 1–4   (1=blink1hz, 2=blink10hz, 3=blink50hz, 4=pulse)
+//
+// NEW POV COMMANDS:
+//   pov rainbow
+//   pov stripes red,white,blue
+//   pov rings red,green,blue,yellow,purple
+//   pov gradient purple,black
+//   pov sine yellow,black
+//   pov diamond gold,black
+//   pov zigzag red,white,black
+//   pov stepped red,white,gold,black
+//   pov sparkle white,black
+//   pov text HELLO           (uses current color as text, black background)
+//   pov off
+//   speed 2000               (column delay in microseconds; lower = faster)
 //
 // Architecture:
-//   • main.ino handles setup, Bluetooth communication, and parsing.
-//   • patterns.h defines reusable animation effects.
-// 
+//   bluetoothStrip.ino  — setup, BT comms, command parsing
+//   patterns.h          — blinkPattern, pulsePattern (unchanged)
+//   pov_patterns.h      — POV buffer, pattern generators, font
+//
 // Dependencies:
-// esp32 by Espressif Systems version 2.0.17 or 2.x.xx to use classic Bluetooth
+//   esp32 by Espressif Systems version 2.0.17 or 2.x.xx
 // ============================================================
 
-#include "BluetoothSerial.h"  // Enables Bluetooth Serial communication
-#include <FastLED.h>          // Library for controlling WS2812 LEDs
-#include "patterns.h"         // Include our custom LED pattern functions
-
-// #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-// #error Bluetooth is not enabled! Please run `make menuconfig` to enable it.
-// #endif
+#include "BluetoothSerial.h"
+#include <FastLED.h>
+#include "patterns.h"       // existing — NOT modified
+#include "pov_patterns.h"   // ── NEW: POV patterns ──
 
 // ------------------- Hardware Configuration -------------------
-const int NUM_LEDS = 5;      // Number of LEDs on your WS2812 strip use const int so patterns.h file can recognize it
-#define DATA_PIN 2     // GPIO pin connected to LED data line
+const int NUM_LEDS = 5;
+#define DATA_PIN 2
 
 // ------------------- Global Variables -------------------
-int bright = 65;         // Default brightness level (0–255)
-BluetoothSerial SerialBT; // Bluetooth serial object for communication
-CRGB leds[NUM_LEDS];      // Array of LED color data
-String line;               // Buffer to store incoming Bluetooth command
-String currentPattern = ""; // Which animation pattern is currently active
-CRGB currentColor = CRGB::Red; // Default LED color (red)
+int bright = 65;
+BluetoothSerial SerialBT;
+CRGB leds[NUM_LEDS];
+String line;
+String currentPattern = "";
+CRGB currentColor = CRGB::Red;
+
+// POV state (declared extern in pov_patterns.h, defined here)
+CRGB     povBuffer[POV_MAX_COLS][POV_MAX_LEDS];
+uint16_t povNumCols     = 60;
+uint32_t povColDelayUs  = 2000;
+uint16_t povCurrentCol  = 0;
+uint32_t povLastColTime = 0;
+bool     povActive      = false;
 
 // ============================================================
 // setup()
 // ============================================================
-// Runs once at startup. Initializes Serial, Bluetooth, and LED strip.
-// ============================================================
 void setup() {
-  Serial.begin(115200);          // USB serial for debugging
-  SerialBT.begin("ESP32-BT-Slave"); // Name that appears over Bluetooth
+  Serial.begin(115200);
+  SerialBT.begin("ESP32-BT-Slave");
 
-  // Initialize FastLED: specify LED type, data pin, and color order
   FastLED.addLeds<WS2812, DATA_PIN, GRB>(leds, NUM_LEDS);
-
-  // Set overall brightness (acts as a global dimmer)
   FastLED.setBrightness(bright);
 
-  // Turn all LEDs off initially
   fill_solid(leds, NUM_LEDS, CRGB::Black);
   FastLED.show();
 
-  Serial.println("Bluetooth ready. Try commands like:");
+  Serial.println("Bluetooth ready. Commands:");
   Serial.println("  led on / led off");
   Serial.println("  color red / color #FF00AA");
-  Serial.println("  pattern 1–4");
+  Serial.println("  bright 0-255");
+  Serial.println("  pattern 1-4");
+  Serial.println("  pov rainbow / pov stripes red,white,blue / pov off");
+  Serial.println("  pov sine yellow,black / pov diamond gold,black");
+  Serial.println("  pov zigzag red,white,black / pov stepped red,white,gold,black");
+  Serial.println("  pov sparkle white,black / pov text HELLO");
+  Serial.println("  speed 2000  (microseconds per column)");
 }
 
 // ============================================================
 // loop()
 // ============================================================
-// Runs repeatedly after setup(). Handles incoming Bluetooth data
-// and continuously updates LED patterns (non-blocking).
-// ============================================================
 void loop() {
   // ------------------------------------------------------------
-  // Step 1: Read Bluetooth data character-by-character
+  // Step 1: Read Bluetooth data character by character
   // ------------------------------------------------------------
   while (SerialBT.available()) {
     char c = SerialBT.read();
-
-    // A newline or carriage return indicates the end of a command
     if (c == '\r' || c == '\n') {
-      if (line.length()) {        // Only process if buffer isn't empty
-        handleCommand(line);      // Parse and execute command
-        line = "";                // Clear the buffer
+      if (line.length()) {
+        handleCommand(line);
+        line = "";
       }
     } else {
-      // Otherwise, keep appending characters to the command buffer
       line += c;
     }
   }
 
   // ------------------------------------------------------------
-  // Step 2: Continuously run the current pattern
+  // Step 2: Run blink/pulse patterns (only when POV is not active)
+  // POV and blink/pulse are mutually exclusive — only one runs at a time.
   // ------------------------------------------------------------
-  // Each pattern function handles its own timing logic using millis().
-  if (currentPattern == "blink1hz")      blinkPattern(1, currentColor);
-  else if (currentPattern == "blink10hz") blinkPattern(10, currentColor);
-  else if (currentPattern == "blink50hz") blinkPattern(50, currentColor);
-  else if (currentPattern == "pulse")    pulsePattern(currentColor);
+  if (!povActive) {
+    if      (currentPattern == "blink1hz")  blinkPattern(1,  currentColor);
+    else if (currentPattern == "blink10hz") blinkPattern(10, currentColor);
+    else if (currentPattern == "blink50hz") blinkPattern(50, currentColor);
+    else if (currentPattern == "pulse")     pulsePattern(currentColor);
+  }
 
-  // A short delay helps stabilize Bluetooth and timing loops.
-  delay(5);
+  // ------------------------------------------------------------
+  // Step 3: Advance the POV column timer (only when POV is active)
+  // ── NEW ──
+  // povTick() checks micros() and shows the next column if enough
+  // time has passed. It returns immediately if it's not time yet,
+  // so the BT receive loop above never gets starved.
+  // ------------------------------------------------------------
+  if (povActive) {
+    povTick();
+  }
+
+  // ------------------------------------------------------------
+  // yield() lets the ESP32's FreeRTOS background tasks run
+  // (including the Bluetooth stack). Replaces the old delay(5)
+  // which would have blocked the POV column timer from hitting
+  // its scheduled time slots.
+  // ------------------------------------------------------------
+  yield();
 }
 
 // ============================================================
 // handleCommand()
 // ============================================================
-// This function parses a complete command string (e.g. "pattern 1")
-// and executes the corresponding LED behavior.
-// ============================================================
 void handleCommand(String cmd) {
-  cmd.trim();          // Remove leading/trailing spaces or \r\n
-  cmd.toLowerCase();   // Make command case-insensitive
+  cmd.trim();
+  cmd.toLowerCase();
   Serial.println("CMD = [" + cmd + "]");
 
   // --------------- LED ON ---------------
   if (cmd == "led on") {
+    povActive = false;                          // ── NEW: stop POV if running
     fill_solid(leds, NUM_LEDS, currentColor);
     FastLED.show();
 
@@ -116,80 +150,241 @@ void handleCommand(String cmd) {
   } else if (cmd == "led off") {
     fill_solid(leds, NUM_LEDS, CRGB::Black);
     FastLED.show();
-    currentPattern = "";  // stop any active pattern
+    currentPattern = "";
+    povActive = false;                          // ── NEW: stop POV if running
 
   // --------------- COLOR CHANGE ---------------
   } else if (cmd.startsWith("color ")) {
-    // Extract the substring after "color "
     String colorName = cmd.substring(6);
     currentColor = colorFromString(colorName);
     fill_solid(leds, NUM_LEDS, currentColor);
     FastLED.show();
 
-  // --------------- CHANGE BRIGHTNESS ---------------
+  // --------------- BRIGHTNESS ---------------
   } else if (cmd.startsWith("bright ")) {
-      String brightness = cmd.substring(7);                   // input integer to set brightness value
-      bright = brightness.toInt();
-      if (bright > 255) {
-        Serial.println("255 is max value. Please lower.");
-      
-      } else{ 
-        FastLED.setBrightness(bright); // ← replaces current brightness
-        FastLED.show(); }
+    bright = cmd.substring(7).toInt();
+    if (bright > 255) {
+      Serial.println("255 is max value. Please lower.");
+    } else {
+      FastLED.setBrightness(bright);
+      FastLED.show();
+    }
 
-  // --------------- PATTERN SELECT ---------------
+  // --------------- BLINK / PULSE PATTERNS ---------------
   } else if (cmd.startsWith("pattern ")) {
-    String pattern = cmd.substring(8); // extract everything after "pattern "
+    String pattern = cmd.substring(8);
+    povActive = false;                          // ── NEW: stop POV if running
 
-    // Match user input to defined patterns
-    if (pattern == "1") currentPattern = "blink1hz";
+    if      (pattern == "1") currentPattern = "blink1hz";
     else if (pattern == "2") currentPattern = "blink10hz";
     else if (pattern == "3") currentPattern = "blink50hz";
     else if (pattern == "4") currentPattern = "pulse";
-    else currentPattern = ""; // stop pattern if invalid number
+    else                     currentPattern = "";
 
     Serial.println("Pattern set to: " + currentPattern);
+
+  // ----------------------------------------------------------------
+  // ── NEW: POV PATTERNS ──
+  // Format: "pov <name> [color1,color2,...]"
+  // The colour list is optional — defaults are set per pattern below.
+  // Colour names and hex codes use the same colorFromString() as
+  // the existing "color" command.
+  // ----------------------------------------------------------------
+  } else if (cmd.startsWith("pov ")) {
+    String sub      = cmd.substring(4);         // everything after "pov "
+    int    spaceIdx = sub.indexOf(' ');
+
+    // Split into pattern name and (optional) colour string
+    String patName, colorStr;
+    if (spaceIdx == -1) {
+      patName  = sub;
+      colorStr = "";
+    } else {
+      patName  = sub.substring(0, spaceIdx);
+      colorStr = sub.substring(spaceIdx + 1);
+    }
+
+    // Parse up to 4 colours from comma-separated string
+    CRGB    colors[4];
+    uint8_t numColors = 0;
+    parsePovColors(colorStr, colors, &numColors, 4);
+
+    // Stop blink/pulse when POV takes over
+    currentPattern = "";
+
+    // ── Pattern dispatch ──────────────────────────────────
+    if (patName == "off") {
+      povActive = false;
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      FastLED.show();
+      SerialBT.println("OK: POV off");
+
+    } else if (patName == "rainbow") {
+      povRainbow(60);
+      povActive = true;
+      SerialBT.println("OK: POV rainbow");
+
+    } else if (patName == "stripes") {
+      // Default: red + blue if no colours given
+      if (numColors == 0) { colors[0] = CRGB::Red; colors[1] = CRGB::Blue; numColors = 2; }
+      povStripes(60, colors, numColors);
+      povActive = true;
+      SerialBT.println("OK: POV stripes");
+
+    } else if (patName == "rings") {
+      // Default: cycle through red, green, blue across LED rows
+      if (numColors == 0) {
+        colors[0]=CRGB::Red; colors[1]=CRGB::Green;
+        colors[2]=CRGB::Blue; numColors = 3;
+      }
+      povRings(60, colors, numColors);
+      povActive = true;
+      SerialBT.println("OK: POV rings");
+
+    } else if (patName == "gradient") {
+      // Default: currentColor fading to black
+      if (numColors < 1) colors[0] = currentColor;
+      if (numColors < 2) colors[1] = CRGB::Black;
+      povGradient(60, colors[0], colors[1]);
+      povActive = true;
+      SerialBT.println("OK: POV gradient");
+
+    } else if (patName == "sine") {
+      // Default: white wave on black
+      if (numColors < 1) colors[0] = CRGB::White;
+      if (numColors < 2) colors[1] = CRGB::Black;
+      povSine(60, colors[0], colors[1]);
+      povActive = true;
+      SerialBT.println("OK: POV sine");
+
+    } else if (patName == "diamond") {
+      // Default: gold diamonds on black
+      if (numColors < 1) colors[0] = CRGB(255, 180, 0);
+      if (numColors < 2) colors[1] = CRGB::Black;
+      povDiamond(60, colors[0], colors[1]);
+      povActive = true;
+      SerialBT.println("OK: POV diamond");
+
+    } else if (patName == "zigzag") {
+      // Default: red zigzag on black (last colour = background)
+      if (numColors < 2) { colors[0] = CRGB::Red; colors[1] = CRGB::Black; numColors = 2; }
+      povZigzag(60, colors, numColors);
+      povActive = true;
+      SerialBT.println("OK: POV zigzag");
+
+    } else if (patName == "stepped") {
+      // Default: red/white/gold on black (last colour = background)
+      if (numColors < 2) {
+        colors[0]=CRGB::Red; colors[1]=CRGB::White;
+        colors[2]=CRGB(255,180,0); colors[3]=CRGB::Black; numColors = 4;
+      }
+      povStepped(60, colors, numColors);
+      povActive = true;
+      SerialBT.println("OK: POV stepped");
+
+    } else if (patName == "sparkle") {
+      // Default: white sparks on black
+      if (numColors < 1) colors[0] = CRGB::White;
+      if (numColors < 2) colors[1] = CRGB::Black;
+      povSparkle(60, colors[0], colors[1]);
+      povActive = true;
+      SerialBT.println("OK: POV sparkle");
+
+    } else if (patName == "text") {
+      // colorStr IS the text here (no colour argument for text).
+      // Text uses currentColor as foreground and black as background.
+      // Example: "pov text HELLO"  (colorStr = "hello" after toLowerCase)
+      if (colorStr.length() == 0) {
+        SerialBT.println("ERR: pov text <word>");
+      } else {
+        povText(colorStr.c_str(), currentColor, CRGB::Black);
+        povActive = true;
+        SerialBT.println("OK: POV text -> " + colorStr);
+      }
+
+    } else {
+      SerialBT.println("ERR: unknown POV pattern '" + patName + "'");
+    }
+
+  // ----------------------------------------------------------------
+  // ── NEW: SPEED COMMAND ──
+  // Sets the column display time in microseconds.
+  // Lower value = columns advance faster = strip must spin faster.
+  // Range: 200 us (very fast) to 100000 us (very slow / 10 Hz)
+  // ----------------------------------------------------------------
+  } else if (cmd.startsWith("speed ")) {
+    uint32_t val = (uint32_t)cmd.substring(6).toInt();
+    if (val >= 200 && val <= 100000) {
+      povColDelayUs = val;
+      SerialBT.print("OK: speed = ");
+      SerialBT.print(val);
+      SerialBT.println(" us/col");
+    } else {
+      SerialBT.println("ERR: speed must be 200-100000");
+    }
 
   // --------------- UNKNOWN COMMAND ---------------
   } else {
     Serial.println("Unknown command");
+    SerialBT.println("ERR: unknown command");
   }
 }
 
 // ============================================================
-// colorFromString()
+// parsePovColors()
 // ============================================================
-// Converts text like "red", "blue", "#FFAA33", or "random"
-// into an actual CRGB color object recognized by FastLED.
+// Splits a comma-separated colour string (e.g. "red,white,blue")
+// into an array of CRGB values using the existing colorFromString().
+// Fills 'colors[]' and sets *count to the number of colours found.
+// maxColors caps how many are parsed.
+// ============================================================
+void parsePovColors(String s, CRGB* colors, uint8_t* count, uint8_t maxColors) {
+  *count = 0;
+  s.trim();
+  if (s.length() == 0) return;
+
+  while (*count < maxColors && s.length() > 0) {
+    int    commaIdx = s.indexOf(',');
+    String part;
+
+    if (commaIdx == -1) {
+      part = s;
+      s    = "";
+    } else {
+      part = s.substring(0, commaIdx);
+      s    = s.substring(commaIdx + 1);
+    }
+    part.trim();
+    if (part.length() > 0) {
+      colors[(*count)++] = colorFromString(part);
+    }
+  }
+}
+
+// ============================================================
+// colorFromString()  — unchanged from original
 // ============================================================
 CRGB colorFromString(String s) {
   s.trim(); s.toLowerCase();
 
-  // Generate a random color if user types "random"
   if (s == "random" || s == "rand") return CHSV(random8(), 255, 255);
+  if (s == "off" || s == "black")   return CRGB::Black;
 
-  // "off" or "black" both mean turn LEDs off
-  if (s == "off" || s == "black") return CRGB::Black;
-
-  // Hex color format "#RRGGBB"
   if (s.length() == 7 && s[0] == '#') {
-    // Convert string to integer (base 16)
     uint32_t v = strtoul(s.c_str() + 1, nullptr, 16);
     return CRGB((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
   }
 
-  // Common color name lookup table
   struct { const char* name; CRGB c; } map[] = {
     {"red",CRGB::Red},{"green",CRGB::Green},{"blue",CRGB::Blue},
     {"white",CRGB::White},{"yellow",CRGB::Yellow},{"cyan",CRGB::Cyan},
     {"magenta",CRGB::Magenta},{"purple",CRGB::Purple},{"orange",CRGB::Orange},
-    {"pink", CRGB(255,105,180)}, {"teal", CRGB(0,128,128)}
+    {"pink", CRGB(255,105,180)}, {"teal", CRGB(0,128,128)},
+    {"gold", CRGB(255,180,0)}   // ── NEW: added gold for stepped/diamond defaults
   };
 
-  // Iterate through the list and find a match
   for (auto &m : map)
     if (s == m.name) return m.c;
 
-  // Default fallback if color name isn't recognized
   return CRGB::White;
 }
