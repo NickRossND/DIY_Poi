@@ -83,7 +83,7 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  SerialBT.begin("ESP32-BT-Slave");
+  SerialBT.begin("FlyingDildos");
   SerialBT.register_callback(btCallback);
 
   WiFi.mode(WIFI_STA);

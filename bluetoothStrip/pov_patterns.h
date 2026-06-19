@@ -364,7 +364,7 @@ void povSparkle(uint16_t numCols, CRGB sparkColor, CRGB bgColor,
 
 struct PovGlyph { char c; uint8_t rows[5]; };
 
-const PovGlyph POV_FONT[] = {
+const PovGlyph POV_FONT[] PROGMEM = {
   {' ', {0b000, 0b000, 0b000, 0b000, 0b000}},
   {'A', {0b010, 0b101, 0b111, 0b101, 0b101}},
   {'B', {0b110, 0b101, 0b110, 0b101, 0b110}},
@@ -411,13 +411,19 @@ const PovGlyph POV_FONT[] = {
 };
 const uint8_t POV_FONT_COUNT = sizeof(POV_FONT) / sizeof(POV_FONT[0]);
 
-// Look up a character's glyph — returns the row data array
-const uint8_t* povGetGlyph(char c) {
+// Look up a character's glyph — copies rows out of PROGMEM into a local buffer
+void povGetGlyph(char c, uint8_t out[5]) {
   c = toupper(c);
   for (uint8_t i = 0; i < POV_FONT_COUNT; i++) {
-    if (POV_FONT[i].c == c) return POV_FONT[i].rows;
+    if (pgm_read_byte(&POV_FONT[i].c) == c) {
+      for (uint8_t r = 0; r < 5; r++)
+        out[r] = pgm_read_byte(&POV_FONT[i].rows[r]);
+      return;
+    }
   }
-  return POV_FONT[0].rows;   // fall back to space if not found
+  // fall back to space
+  for (uint8_t r = 0; r < 5; r++)
+    out[r] = pgm_read_byte(&POV_FONT[0].rows[r]);
 }
 
 // Render text into the POV buffer
@@ -435,10 +441,11 @@ void povText(const char* text, CRGB fgColor, CRGB bgColor) {
 
   // Draw each character
   uint16_t colOffset = 0;
+  uint8_t glyphBuf[5];
   for (uint8_t ci = 0; ci < len && colOffset + POV_CHAR_W <= numCols; ci++) {
-    const uint8_t* glyph = povGetGlyph(text[ci]);
+    povGetGlyph(text[ci], glyphBuf);
     for (int row = 0; row < min(NUM_LEDS, 5); row++) {
-      uint8_t bits = glyph[row];
+      uint8_t bits = glyphBuf[row];
       for (int bit = 0; bit < POV_CHAR_W; bit++) {
         // bit 2 = leftmost column, bit 0 = rightmost
         if ((bits >> (POV_CHAR_W - 1 - bit)) & 1) {
